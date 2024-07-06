@@ -17,3 +17,5 @@ pub fn search(safe: &mut Safe, prefix: &[u8]) {
         safe.update_salt_nonce(|n| rng.fill(n));
     }
 }
+
+pub fn 
