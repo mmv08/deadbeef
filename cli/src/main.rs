@@ -1,5 +1,6 @@
 mod chain;
 mod deployment;
+mod gpu;
 
 use self::chain::{Chain, Singleton};
 use chain::Details;
@@ -10,8 +11,9 @@ use std::{num::NonZeroUsize, process, str::FromStr, sync::mpsc, thread};
 
 /// Generate vanity addresses for Safe deployments.
 #[derive(Clone, Parser)]
+#[command(group(clap::ArgGroup::new("gpu_mode").args(["gpu", "list_gpus"])))]
 struct Args {
-    /// The number of parallel threads to use. Defaults to the number of CPUs.
+    /// Number of CPU mining threads to use. Ignored when `--gpu` is set.
     #[arg(short = 'n', long, default_value_t = num_cpus::get())]
     threads: usize,
 
@@ -19,7 +21,12 @@ struct Args {
     ///
     /// Can be specified multiple times in order to specify multiple owners.
     /// They will be included in the provided order.
-    #[arg(short, long = "owner", required = true, num_args = 1..)]
+    #[arg(
+        short,
+        long = "owner",
+        required_unless_present = "list_gpus",
+        num_args = 1..
+    )]
     owners: Vec<NonZeroAddress>,
 
     /// Owner signature threshold.
@@ -27,8 +34,8 @@ struct Args {
     threshold: usize,
 
     /// The prefix to look for.
-    #[arg(short, long)]
-    prefix: Hex,
+    #[arg(short, long, required_unless_present = "list_gpus")]
+    prefix: Option<Hex>,
 
     /// The chain ID to find a vanity Safe address for. If the chain is not
     /// supported, then all of '--proxy-factory', '--proxy-init-code', and
@@ -69,6 +76,41 @@ struct Args {
     #[arg(long)]
     fallback_handler: Option<NonZeroAddress>,
 
+    /// Mine using a GPU.
+    #[arg(long)]
+    gpu: bool,
+
+    /// List available GPU adapters and exit.
+    #[arg(long)]
+    list_gpus: bool,
+
+    /// Select the GPU backend to use. `gl` is a fallback path; the current CLI
+    /// exits without tearing down a GL miner before process exit.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = gpu::Backend::Primary,
+        requires = "gpu_mode"
+    )]
+    gpu_backend: gpu::Backend,
+
+    /// Select the GPU adapter index from `--list-gpus`.
+    #[arg(long, requires = "gpu", conflicts_with = "list_gpus")]
+    gpu_adapter: Option<usize>,
+
+    /// Requested GPU candidates per dispatch. Rounded to a supported size.
+    #[arg(
+        long,
+        default_value_t = gpu::DEFAULT_BATCH_SIZE,
+        requires = "gpu",
+        conflicts_with = "list_gpus"
+    )]
+    gpu_batch_size: u32,
+
+    /// Allow software-rendered GPU adapters. Intended for tests and diagnostics.
+    #[arg(long, hide = true, requires = "gpu", conflicts_with = "list_gpus")]
+    allow_software_gpu: bool,
+
     /// Quiet mode.
     ///
     /// Only output the transaction calldata without any extra information.
@@ -101,8 +143,30 @@ impl FromStr for Hex {
     }
 }
 
+fn validate_prefix(prefix: &[u8]) -> Result<(), &'static str> {
+    if prefix.len() > 20 {
+        Err("prefix cannot be longer than an Ethereum address")
+    } else {
+        Ok(())
+    }
+}
+
 fn main() {
     let args = Args::parse();
+
+    if args.list_gpus {
+        if let Err(err) = gpu::list_adapters(args.gpu_backend) {
+            eprintln!("error: {err}");
+            process::exit(1);
+        }
+        process::exit(0);
+    }
+
+    let prefix = args.prefix.expect("missing prefix");
+    if let Err(err) = validate_prefix(&prefix.0) {
+        eprintln!("error: {err}");
+        process::exit(2);
+    }
 
     let threads = NonZeroUsize::new(args.threads);
     let chain = args.chain.details();
@@ -178,8 +242,25 @@ fn main() {
         .expect("unsupported chain");
     let explorer = chain.as_ref().map(Details::explorer);
 
-    let setup = || (Safe::new(config.clone()), args.prefix.0.clone());
-    let safe = if let Some(threads) = threads {
+    let setup = || (Safe::new(config.clone()), prefix.0.clone());
+    let safe = if args.gpu {
+        let mut safe = Safe::new(config.clone());
+        if let Err(err) = gpu::search(
+            &mut safe,
+            &prefix.0,
+            gpu::Options {
+                backend: args.gpu_backend,
+                adapter: args.gpu_adapter,
+                batch_size: args.gpu_batch_size,
+                allow_software_adapter: args.allow_software_gpu,
+                progress: !args.quiet,
+            },
+        ) {
+            eprintln!("GPU mining failed: {err}");
+            process::exit(1);
+        }
+        safe
+    } else if let Some(threads) = threads {
         let (sender, receiver) = mpsc::channel();
         let _threads = (0..threads.get())
             .map(|_| {
@@ -246,4 +327,100 @@ fn main() {
     }
 
     process::exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn list_gpus_does_not_require_safe_config() {
+        let args = Args::try_parse_from(["deadbeef", "--list-gpus"]).unwrap();
+        assert!(args.list_gpus);
+    }
+
+    #[test]
+    fn parses_gpu_options() {
+        let args = Args::try_parse_from([
+            "deadbeef",
+            "--owner",
+            "0x1111111111111111111111111111111111111111",
+            "--prefix",
+            "0x00",
+            "--gpu",
+            "--gpu-backend",
+            "metal",
+            "--gpu-adapter",
+            "1",
+            "--gpu-batch-size",
+            "257",
+        ])
+        .unwrap();
+
+        assert!(args.gpu);
+        assert_eq!(args.gpu_backend, gpu::Backend::Metal);
+        assert_eq!(args.gpu_adapter, Some(1));
+        assert_eq!(args.gpu_batch_size, 257);
+    }
+
+    #[test]
+    fn gpu_options_require_gpu_mode() {
+        for args in [
+            &[
+                "deadbeef",
+                "--owner",
+                "0x1111111111111111111111111111111111111111",
+                "--prefix",
+                "0x00",
+                "--gpu-backend",
+                "metal",
+            ][..],
+            &[
+                "deadbeef",
+                "--owner",
+                "0x1111111111111111111111111111111111111111",
+                "--prefix",
+                "0x00",
+                "--gpu-adapter",
+                "0",
+            ],
+            &[
+                "deadbeef",
+                "--owner",
+                "0x1111111111111111111111111111111111111111",
+                "--prefix",
+                "0x00",
+                "--gpu-batch-size",
+                "257",
+            ],
+        ] {
+            assert!(Args::try_parse_from(args).is_err());
+        }
+    }
+
+    #[test]
+    fn list_gpus_accepts_gpu_backend() {
+        let args =
+            Args::try_parse_from(["deadbeef", "--list-gpus", "--gpu-backend", "gl"]).unwrap();
+
+        assert!(args.list_gpus);
+        assert_eq!(args.gpu_backend, gpu::Backend::Gl);
+    }
+
+    #[test]
+    fn list_gpus_rejects_unused_gpu_batch_size() {
+        assert!(
+            Args::try_parse_from(["deadbeef", "--list-gpus", "--gpu-batch-size", "257"]).is_err()
+        );
+    }
+
+    #[test]
+    fn list_gpus_rejects_unused_gpu_adapter() {
+        assert!(Args::try_parse_from(["deadbeef", "--list-gpus", "--gpu-adapter", "0"]).is_err());
+    }
+
+    #[test]
+    fn rejects_overlong_prefixes() {
+        assert!(validate_prefix(&[0; 21]).is_err());
+    }
 }

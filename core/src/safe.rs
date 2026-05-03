@@ -20,6 +20,28 @@ pub struct Transaction {
     pub calldata: Vec<u8>,
 }
 
+/// Fixed inputs for mining Safe creation addresses.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct SearchContext {
+    /// The Keccak-256 hash of the Safe initializer calldata.
+    pub initializer_hash: [u8; 32],
+    /// The `SafeProxyFactory` address.
+    pub factory: Address,
+    /// The `CREATE2` init code hash for the Safe proxy deployment.
+    pub init_code_hash: [u8; 32],
+}
+
+impl SearchContext {
+    /// Computes the Safe creation address for the specified salt nonce.
+    pub fn creation_address(&self, salt_nonce: [u8; 32]) -> Address {
+        let mut salt = [0_u8; 64];
+        salt[0..32].copy_from_slice(&self.initializer_hash);
+        salt[32..64].copy_from_slice(&salt_nonce);
+
+        Create2::new(self.factory, keccak::v256(&salt), self.init_code_hash).creation_address()
+    }
+}
+
 impl Safe {
     /// Creates a new safe from spcified configuration.
     pub fn new(config: Configuration) -> Self {
@@ -63,10 +85,21 @@ impl Safe {
         &self.initializer
     }
 
+    /// Returns the fixed search context for mining salt nonces.
+    pub fn search_context(&self) -> SearchContext {
+        SearchContext {
+            initializer_hash: self.salt[0..32].try_into().unwrap(),
+            factory: self.config.proxy.factory.get(),
+            init_code_hash: self.config.proxy.init_code_hash(),
+        }
+    }
+
     /// Updates the salt nonce and recomputes the `CREATE2` salt.
     pub fn update_salt_nonce(&mut self, f: impl FnOnce(&mut [u8; 32])) {
-        let salt_nonce = unsafe { &mut *self.salt.get_unchecked_mut(32..).as_mut_ptr().cast() };
-        f(salt_nonce);
+        {
+            let salt_nonce: &mut [u8; 32] = (&mut self.salt[32..64]).try_into().unwrap();
+            f(salt_nonce);
+        }
         *self.create2.salt_mut() = keccak::v256(&self.salt);
     }
 
@@ -87,6 +120,34 @@ mod tests {
     use super::*;
     use crate::config;
     use hex_literal::hex;
+
+    #[test]
+    fn search_context_matches_safe_creation_address() {
+        let mut safe = Safe::new(Configuration {
+            proxy: config::Proxy {
+                factory: address!(nz "1111111111111111111111111111111111111111"),
+                init_code: vec![0xab, 0xcd, 0xef],
+                singleton: address!(nz "2222222222222222222222222222222222222222"),
+            },
+            account: config::Account {
+                owners: vec![
+                    address!(nz "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                    address!(nz "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                ],
+                threshold: 1,
+                setup: None,
+                fallback_handler: None,
+                identifier: None,
+            },
+        });
+        let context = safe.search_context();
+
+        for byte in [0x00, 0x01, 0x7f, 0xff] {
+            let nonce = [byte; 32];
+            safe.update_salt_nonce(|n| *n = nonce);
+            assert_eq!(context.creation_address(nonce), safe.creation_address());
+        }
+    }
 
     #[test]
     fn transaction() {

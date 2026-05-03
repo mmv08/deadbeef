@@ -55,6 +55,156 @@ Note that the owner signature threshold defaults to 1 but can optionally be spec
 deadbeef ... --threshold 2 ...
 ```
 
+## GPU Mining
+
+GPU mining is opt-in.
+
+### Vocabulary
+
+A handful of terms appear throughout this section and the GPU source files. Defining them up front keeps the rest of the section short:
+
+- **wgpu** is the Rust binding for the WebGPU compute API. It lets one shader (a small program the GPU runs in parallel for every input it is given) run on Apple, NVIDIA, AMD, and Intel GPUs through whichever native driver is available.
+- **Metal** (Apple), **Vulkan** (Linux/Windows on most GPUs), **DX12** (Windows), and **GL** (a fallback path) are the native driver choices wgpu can pick.
+- **WSLg** is Microsoft's GPU bridge for the Windows Subsystem for Linux. **Mesa** is the open-source graphics stack that ships with most Linux distros, and **llvmpipe** is its software-only fallback — do not use it for mining, it runs on the CPU.
+- A **dispatch** is one job the CLI hands the GPU. A **workgroup** is a tile of 256 shader invocations the GPU schedules together; a single **invocation** is one independent run of the shader on one candidate salt nonce.
+- **Readback** means copying a buffer's bytes from the GPU back to the CPU. The miner reads back one tiny 36-byte result struct per dispatch, but the readback is synchronous, so we want each dispatch large enough that the readback is not the bottleneck.
+- **Maddr/s** is "millions of candidate addresses per second."
+
+### Usage
+
+List available adapters:
+
+```sh
+deadbeef --list-gpus
+```
+
+The adapter list includes the device type, plus driver details when wgpu reports
+them. If wgpu reports an adapter as `Cpu / Software Rendering`, the miner will
+not select it by default.
+
+Mine with the first available GPU adapter:
+
+```sh
+deadbeef ... --gpu --prefix 0x00
+```
+
+Select an adapter and backend explicitly:
+
+```sh
+deadbeef ... --gpu --gpu-adapter 0 --gpu-backend metal
+deadbeef ... --gpu --gpu-adapter 0 --gpu-backend vulkan
+deadbeef ... --gpu --gpu-adapter 0 --gpu-backend dx12
+deadbeef ... --gpu --gpu-adapter 0 --gpu-backend gl
+```
+
+Use `metal` for Apple GPUs, `vulkan` for NVIDIA on Linux, and `dx12` or `vulkan` for NVIDIA on Windows.
+On WSLg, Vulkan may only expose Mesa `llvmpipe`; if so, use Mesa's D3D12-backed GL path:
+
+```sh
+GALLIUM_DRIVER=d3d12 MESA_D3D12_DEFAULT_ADAPTER_NAME=NVIDIA \
+  deadbeef ... --gpu --gpu-backend gl
+```
+
+`gl` is a fallback backend. In the current CLI implementation, a GL mining run exits without tearing down the GL miner before process exit.
+
+`--gpu-batch-size` requests how many salt nonces are scanned per dispatch.
+The miner rounds that request up to a whole workgroup and clamps very small or very large values to the supported range.
+The default is `8 × 65,535 × 256 = 134,215,680` candidates per dispatch: WebGPU caps each dispatch dimension at 65,535 workgroups, each workgroup runs 256 invocations, and the host stacks 8 such rows to reduce readback overhead while staying backend-neutral.
+
+How to think about the trade-off: each dispatch ends with a synchronous readback of one tiny result struct, which costs a fixed amount of time regardless of batch size. A larger batch amortises that fixed cost over more candidate addresses, so throughput climbs as the batch grows. The catch is that a larger batch also takes longer to complete, so a slow GPU spends more wall time per dispatch and the miner reports progress less often. Pick a value that fills your GPU but still finishes a dispatch in a few seconds. On high-throughput GPUs, larger explicit batch-size requests can stack more rows and reduce readback overhead further; on slower GPUs, the default is intentionally conservative.
+
+GPU mining prints periodic progress to stderr while it runs; `--quiet` disables those progress messages.
+
+### Reference Benchmarks
+
+These numbers are a point-in-time reference, not a guaranteed result. GPU and CPU throughput can change with power state, thermal state, other GPU work, compiler versions, and batch size.
+The CPU benchmark below measures one CPU core in the core mining loop. The normal CLI CPU miner uses multiple threads by default, so it can be faster than the single-core number shown here.
+The benchmark results below were recorded on May 3, 2026 against branch commit `da8cf78`.
+
+Each dispatch row covers `65,535 × 256 = 16,776,960` candidates, so larger `--gpu-batch-size` values use more rows: a single-row dispatch covers about 16.8 million candidates, the default eight-row dispatch covers about 134.2 million, and a 32-row dispatch covers about 536.9 million.
+
+The `DEADBEEF_GPU_BENCH_*` environment variables in the commands below are read only by the ignored benchmark test, not by the normal `deadbeef --gpu` CLI; setting them on a regular mining run has no effect.
+
+MacBook Pro environment:
+
+- MacBook Pro `Mac15,10`
+- Apple M3 Max, 14-core CPU (10 performance, 4 efficiency)
+- Apple M3 Max GPU, 30 cores, Metal backend
+- 36 GB memory
+- macOS 26.4.1
+- Rust 1.95.0, Cargo 1.95.0
+
+MacBook Pro benchmark commands:
+
+```sh
+cargo bench -p deadbeef-bench
+```
+
+```sh
+DEADBEEF_GPU_BENCH_BATCH_SIZE=134215680 \
+cargo test --release -p deadbeef gpu_benchmark_fixed_batches -- --ignored --nocapture
+```
+
+| Miner | Result |
+| --- | --- |
+| CPU, single-thread core loop | 297 ns/address mean, about 3.37 Maddr/s |
+| GPU, Metal, default 8-row dispatch batch | 17,179,607,040 candidates in 66.978 s, about 256.50 Maddr/s |
+
+On this machine, the GPU benchmark is about 76x faster than one CPU core in the core mining loop.
+
+WSL2 desktop environment:
+
+- Ubuntu 24.04.4 LTS on WSL 2.4.12.0, WSLg 1.0.65
+- Windows build 10.0.26200.8246
+- AMD Ryzen 9 7900 12-core CPU, 24 logical CPUs
+- NVIDIA GeForce RTX 5090, 32 GB VRAM, driver 596.21
+- WSLg/Mesa D3D12 GL backend, selected with `GALLIUM_DRIVER=d3d12 MESA_D3D12_DEFAULT_ADAPTER_NAME=NVIDIA --gpu-backend gl`
+- Rust 1.95.0, Cargo 1.95.0
+
+WSL2 benchmark commands:
+
+```sh
+cargo bench -p deadbeef-bench
+```
+
+```sh
+GALLIUM_DRIVER=d3d12 \
+MESA_D3D12_DEFAULT_ADAPTER_NAME=NVIDIA \
+DEADBEEF_GPU_BENCH_BACKEND=gl \
+DEADBEEF_GPU_BENCH_BATCH_SIZE=16776960 \
+cargo test --release -p deadbeef gpu_benchmark_fixed_batches -- --ignored --nocapture
+```
+
+```sh
+GALLIUM_DRIVER=d3d12 \
+MESA_D3D12_DEFAULT_ADAPTER_NAME=NVIDIA \
+DEADBEEF_GPU_BENCH_BACKEND=gl \
+DEADBEEF_GPU_BENCH_BATCH_SIZE=134215680 \
+cargo test --release -p deadbeef gpu_benchmark_fixed_batches -- --ignored --nocapture
+```
+
+```sh
+GALLIUM_DRIVER=d3d12 \
+MESA_D3D12_DEFAULT_ADAPTER_NAME=NVIDIA \
+DEADBEEF_GPU_BENCH_BACKEND=gl \
+DEADBEEF_GPU_BENCH_BATCH_SIZE=536862720 \
+cargo test --release -p deadbeef gpu_benchmark_fixed_batches -- --ignored --nocapture
+```
+
+| Miner | Result |
+| --- | --- |
+| CPU, single-thread core loop | 573.3 ns/address mean, about 1.74 Maddr/s |
+| GPU, GL over D3D12, single-row dispatch batch | 2,147,450,880 candidates in 1.112 s, about 1,930.93 Maddr/s |
+| GPU, GL over D3D12, default 8-row dispatch batch | 17,179,607,040 candidates in 8.159 s, about 2,105.58 Maddr/s |
+| GPU, GL over D3D12, tuned 32-row dispatch batch | 68,718,428,160 candidates in 30.886 s, about 2,224.92 Maddr/s |
+
+On this machine, the fastest GPU benchmark above is about 1,280x faster than one CPU core in the core mining loop.
+
+### GPU Implementation Notes
+
+The GPU miner keeps Safe construction and final verification on the CPU.
+The shader only scans candidate salt nonces and returns a matching nonce for the CPU to re-check.
+
 For using Safe deployments on different chains can also be used:
 
 ```sh

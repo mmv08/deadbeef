@@ -8,7 +8,7 @@ mod safe;
 pub use self::{
     address::{Address, NonZeroAddress},
     config::Configuration,
-    safe::{Safe, Transaction},
+    safe::{Safe, SearchContext, Transaction},
 };
 pub use hex_literal::hex;
 use rand::{rngs::SmallRng, Rng as _, SeedableRng as _};

@@ -6,7 +6,11 @@ publish = false
 license = "GPL-3.0-or-later"
 
 [dependencies]
+bytemuck = { version = "1", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
 deadbeef-core = { version = "0.1.0", path = "../core" }
 hex = "0.4"
 num_cpus = "1"
+pollster = "0.4"
+rand = "0.9"
+wgpu = "29"
